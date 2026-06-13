@@ -1,0 +1,58 @@
+version: 2
+
+sources:
+  - name: silver
+    description: >
+      Cleansed and validated data from the Silver layer of the lakehouse.
+      Written by PySpark jobs running on EMR, loaded into Redshift via COPY commands
+      triggered by Airflow after each Silver job completes.
+    database: "{{ env_var('REDSHIFT_DATABASE', 'ecommerce_dw') }}"
+    schema: silver_raw
+    loader: pyspark_emr
+    loaded_at_field: _ingested_at
+
+    freshness:
+      warn_after: {count: 2, period: hour}
+      error_after: {count: 6, period: hour}
+
+    tables:
+      - name: orders
+        description: "One row per order, deduplicated, cleansed from CDC stream."
+        columns:
+          - name: order_id
+            description: "Surrogate key — UUID from the operational DB."
+            tests:
+              - not_null
+              - unique
+          - name: customer_id
+            tests:
+              - not_null
+          - name: order_status
+            tests:
+              - accepted_values:
+                  values: ["pending", "confirmed", "processing", "shipped",
+                           "delivered", "cancelled", "refunded", "returned"]
+          - name: order_total_usd
+            tests:
+              - not_null
+              - dbt_utils.expression_is_true:
+                  expression: ">= 0"
+
+      - name: customers
+        description: "One row per customer, sourced from the customer service DB."
+        columns:
+          - name: customer_id
+            tests:
+              - not_null
+              - unique
+          - name: email
+            tests:
+              - not_null
+
+      - name: products
+        description: "Product catalogue snapshot, refreshed daily."
+        columns:
+          - name: product_id
+            tests:
+              - not_null
+              - unique

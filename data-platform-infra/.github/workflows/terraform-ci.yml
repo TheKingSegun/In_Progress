@@ -1,0 +1,211 @@
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  TF_VERSION: "1.8.0"
+  AWS_REGION: "eu-west-1"
+
+permissions:
+  id-token: write       # OIDC auth to AWS (no long-lived access keys)
+  contents: read
+  pull-requests: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Validate and lint all modules and environments
+  # --------------------------------------------------------------------------
+  validate:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.50.0
+      - run: |
+          tflint --init
+          for dir in modules/*/; do
+            echo "Linting $dir"
+            tflint --chdir="$dir"
+          done
+
+      - name: Checkov security scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: false
+
+      - name: Validate modules
+        run: |
+          for dir in modules/*/; do
+            echo "Validating $dir"
+            cd "$dir" && terraform init -backend=false && terraform validate && cd -
+          done
+
+  # --------------------------------------------------------------------------
+  # Plan all environments on every PR
+  # --------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+      fail-fast: false
+
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Infracost estimate
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+      - run: infracost breakdown --path=tfplan --format=json > infracost.json
+        continue-on-error: true
+
+      - name: Post plan + cost to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/${{ matrix.environment }}/plan_output.txt', 'utf8');
+            const truncated = plan.length > 30000 ? '...(truncated)\n' + plan.slice(-30000) : plan;
+
+            let costSection = '';
+            try {
+              const cost = JSON.parse(fs.readFileSync('environments/${{ matrix.environment }}/infracost.json', 'utf8'));
+              costSection = `\n### Cost estimate\n\`\`\`\nTotal monthly: ${cost.totalMonthlyCost}\nDiff: ${cost.diffTotalMonthlyCost}\n\`\`\``;
+            } catch {}
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — \`${{ matrix.environment }}\`\n\`\`\`\n${truncated}\n\`\`\`${costSection}`
+            });
+
+  # --------------------------------------------------------------------------
+  # Apply to dev automatically on merge
+  # --------------------------------------------------------------------------
+  apply-dev:
+    name: Apply → dev
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev    # GitHub environment with auto-approval
+    defaults:
+      run:
+        working-directory: environments/dev
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - run: terraform init
+      - run: terraform apply -auto-approve
+
+  # --------------------------------------------------------------------------
+  # Apply to staging — requires manual approval in GitHub environment gate
+  # --------------------------------------------------------------------------
+  apply-staging:
+    name: Apply → staging
+    needs: apply-dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging    # GitHub environment with 1-person approval required
+    defaults:
+      run:
+        working-directory: environments/staging
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -auto-approve
+
+  # --------------------------------------------------------------------------
+  # Apply to prod — requires 2-person approval in GitHub environment gate
+  # --------------------------------------------------------------------------
+  apply-prod:
+    name: Apply → prod
+    needs: apply-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production    # GitHub environment with 2-person approval + reviewer list
+    defaults:
+      run:
+        working-directory: environments/prod
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -auto-approve

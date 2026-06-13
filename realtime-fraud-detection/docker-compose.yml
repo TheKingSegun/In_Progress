@@ -1,0 +1,131 @@
+---
+# Local development stack for fraud detection pipeline
+#
+# Services:
+#   Kafka (KRaft mode, no ZooKeeper) — transaction event bus
+#   Redis                            — online feature store
+#   Postgres                         — offline feature store + audit trail
+#   Spark                            — streaming processor
+#
+# Access:
+#   Kafka:    localhost:9092
+#   Redis:    localhost:6379
+#   Postgres: localhost:5432
+#   Spark UI: http://localhost:4040 (when job is running)
+
+version: "3.8"
+
+services:
+  # --------------------------------------------------------------------------
+  # Kafka (KRaft mode — no ZooKeeper)
+  # --------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9092 --list
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Create topics on startup
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -c "
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+          --topic transactions.raw --partitions 12 --replication-factor 1 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+          --topic transactions.scored --partitions 12 --replication-factor 1 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+          --topic fraud.alerts --partitions 3 --replication-factor 1 &&
+        echo 'Topics created'
+      "
+
+  # --------------------------------------------------------------------------
+  # Redis — online feature store
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # --------------------------------------------------------------------------
+  # Postgres — offline features + transaction audit log
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud_local
+      POSTGRES_DB: fraud_detection
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Spark — streaming processor
+  # --------------------------------------------------------------------------
+  spark:
+    image: bitnami/spark:3.5.1
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "4040:4040"    # Spark UI
+      - "7077:7077"
+    volumes:
+      - ./streaming:/opt/streaming
+    command: >
+      spark-submit
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,
+                   org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.1
+        --conf spark.sql.streaming.checkpointLocation=/tmp/checkpoints
+        /opt/streaming/processor/fraud_detection_stream.py
+        --kafka-bootstrap-servers kafka:9092
+        --redis-host redis
+        --checkpoint-path /tmp/checkpoints
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
+  postgres-data:

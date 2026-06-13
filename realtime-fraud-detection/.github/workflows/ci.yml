@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-quality:
+    name: Python Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r streaming/requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check streaming/ --output-format=github
+
+      - name: Type check
+        run: mypy streaming/ --ignore-missing-imports
+
+      - name: Unit tests
+        run: |
+          pytest streaming/tests/ \
+            -v \
+            --tb=short \
+            --cov=streaming \
+            --cov-report=xml \
+            --cov-fail-under=75
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build producer image
+        run: docker build -t fraud-producer:test -f streaming/producer/Dockerfile .
+
+      - name: Build processor image
+        run: docker build -t fraud-processor:test -f streaming/processor/Dockerfile .
+
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - run: terraform init -backend=false
+      - run: terraform validate
+      - run: terraform fmt -check -recursive
+
+      - name: Security scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform

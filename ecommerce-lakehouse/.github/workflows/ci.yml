@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  DBT_PROFILES_DIR: ./dbt
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Python: lint, type check, unit tests
+  # --------------------------------------------------------------------------
+  python-quality:
+    name: Python Quality
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spark
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check . --output-format=github
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      - name: Type check (mypy)
+        run: mypy jobs/ utils/ --ignore-missing-imports --strict
+
+      - name: Unit tests
+        run: |
+          pytest tests/ \
+            --tb=short \
+            -v \
+            --junitxml=test-results.xml \
+            --cov=jobs \
+            --cov=utils \
+            --cov-report=xml \
+            --cov-fail-under=80
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: spark/coverage.xml
+          flags: pyspark
+
+  # --------------------------------------------------------------------------
+  # dbt: slim CI build (only changed models + downstream)
+  # --------------------------------------------------------------------------
+  dbt-slim-ci:
+    name: dbt Slim CI
+    runs-on: ubuntu-latest
+    needs: python-quality
+    defaults:
+      run:
+        working-directory: dbt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dbt
+        run: pip install dbt-redshift==1.8.0
+
+      - name: dbt deps
+        run: dbt deps
+
+      # Fetch the production manifest to enable slim CI (state comparison)
+      - name: Download production manifest
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp s3://${{ secrets.DBT_ARTIFACT_BUCKET }}/prod/manifest.json ./prod_manifest.json || \
+          echo "No production manifest found — running full build"
+
+      - name: dbt compile (validate SQL syntax)
+        env:
+          DBT_TARGET: ci
+          REDSHIFT_HOST: ${{ secrets.CI_REDSHIFT_HOST }}
+          REDSHIFT_PASSWORD: ${{ secrets.CI_REDSHIFT_PASSWORD }}
+        run: dbt compile --profiles-dir . --target ci
+
+      - name: dbt build (changed + downstream)
+        env:
+          DBT_TARGET: ci
+          REDSHIFT_HOST: ${{ secrets.CI_REDSHIFT_HOST }}
+          REDSHIFT_PASSWORD: ${{ secrets.CI_REDSHIFT_PASSWORD }}
+        run: |
+          if [ -f prod_manifest.json ]; then
+            dbt build \
+              --profiles-dir . \
+              --target ci \
+              --select "state:modified+" \
+              --defer \
+              --state ./prod_manifest.json
+          else
+            dbt build --profiles-dir . --target ci
+          fi
+
+      - name: Upload dbt artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dbt-artifacts
+          path: dbt/target/
+
+  # --------------------------------------------------------------------------
+  # Terraform: validate + plan (no apply on PRs)
+  # --------------------------------------------------------------------------
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    permissions:
+      pull-requests: write  # Post plan as PR comment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform Init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform init -backend-config=environments/dev.tfbackend
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Security scan (checkov)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          soft_fail: false
+          skip_check: CKV_AWS_144,CKV_AWS_18  # Cross-region replication + access logging on audit bucket
+
+      - name: Terraform Plan
+        id: plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform plan \
+            -var-file=environments/dev.tfvars \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.slice(0, 60000) + '\n\n...(truncated)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
+            });
